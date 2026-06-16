@@ -50,8 +50,9 @@
 .NOTES
     Author : AD Security Audit
     Requires: RSAT ActiveDirectory module (mandatory).
-              RSAT GroupPolicy, DnsServer and ADCSAdministration modules (optional,
-              for the respective sections).
+              RSAT GroupPolicy module (optional, for the Group Policy sections).
+              RSAT DnsServer module  (optional, for the DNS zones section; needs -Server).
+              All are Microsoft RSAT components - no third-party modules are used.
     Run from a domain-joined machine, ideally as a member of Domain Admins or with
     delegated read rights, in an elevated PowerShell session.
 
@@ -326,9 +327,11 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 }
 Import-Module ActiveDirectory -ErrorAction Stop
 
+# AD CS, trusts, sites, schema, etc. are all read through the ActiveDirectory
+# module (LDAP queries against the configuration partition), so no extra module
+# is needed for those. GroupPolicy and DnsServer are the only optional ones.
 $hasGPO  = [bool](Get-Module -ListAvailable -Name GroupPolicy)
 $hasDns  = [bool](Get-Module -ListAvailable -Name DnsServer)
-$hasADCS = [bool](Get-Module -ListAvailable -Name ADCSAdministration)
 if ($hasGPO)  { Import-Module GroupPolicy -ErrorAction SilentlyContinue }
 if ($hasDns)  { Import-Module DnsServer   -ErrorAction SilentlyContinue }
 
@@ -917,7 +920,7 @@ try {
         Select-Object @{n='Type';e={'Computer'}}, @{n='SamAccountName';e={$_.Name}}, DistinguishedName
 
     $constrained = @()
-    $constrained += Get-ADObject @script:ADParams -Filter { msDS-AllowedToDelegateTo -like '*' } -Properties msDS-AllowedToDelegateTo, samAccountName |
+    $constrained += Get-ADObject @script:ADParams -LDAPFilter '(msDS-AllowedToDelegateTo=*)' -Properties 'msDS-AllowedToDelegateTo','samAccountName' |
         ForEach-Object {
             [pscustomobject]@{
                 SamAccountName = $_.samAccountName
@@ -926,7 +929,7 @@ try {
             }
         }
 
-    $rbcd = Get-ADObject @script:ADParams -Filter { msDS-AllowedToActOnBehalfOfOtherIdentity -like '*' } -Properties msDS-AllowedToActOnBehalfOfOtherIdentity, samAccountName |
+    $rbcd = Get-ADObject @script:ADParams -LDAPFilter '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)' -Properties 'msDS-AllowedToActOnBehalfOfOtherIdentity','samAccountName' |
         Select-Object samAccountName, DistinguishedName
 
     $body  = "<h3>Unconstrained Delegation (excludes DCs)</h3>" + (Convert-ToHtmlTable $unconstrained)

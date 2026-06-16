@@ -17,16 +17,64 @@ It is designed for two complementary goals:
 
 ## Requirements
 
-| Component | Required | Used for |
-|-----------|----------|----------|
-| RSAT **ActiveDirectory** module | Yes | Core directory data |
-| RSAT **GroupPolicy** module | Optional | GPOs, GPO links, full GPO report |
-| RSAT **DnsServer** module | Optional | DNS zones (needs `-Server`) |
-| RSAT **ADCSAdministration** | Optional | Certificate Services awareness |
+Run from a domain-joined machine in an **elevated** PowerShell session
+(PowerShell 5.1 or PowerShell 7+), ideally as a member of *Domain Admins* or with
+delegated read rights. Best results when run against a Domain Controller.
 
-Run from a domain-joined machine in an **elevated** PowerShell session, ideally as
-a member of *Domain Admins* or with delegated read rights. Best results when run
-against a Domain Controller.
+### PowerShell modules
+
+> **None of the modules are third-party.** They are all official **Microsoft RSAT**
+> (Remote Server Administration Tools) components. Nothing needs to be installed
+> from the PowerShell Gallery or any external source.
+
+| Module | Required | Used for | Provided by |
+|--------|----------|----------|-------------|
+| `ActiveDirectory` | **Yes** | All core directory data, trusts, sites, schema, **AD CS**, ACL analysis | Microsoft RSAT: `RSAT-AD-PowerShell` |
+| `GroupPolicy` | Optional | GPOs, GPO links and the full GPO settings report (`-IncludeGPOReport`) | Microsoft RSAT: `GPMC` |
+| `DnsServer` | Optional | DNS zones section (also needs `-Server`) | Microsoft RSAT: `RSAT-DNS-Server` |
+
+> AD CS (certificate templates / ESC analysis), trusts, sites and schema are read
+> via LDAP through the **ActiveDirectory** module — no `ADCSAdministration` or other
+> module is required for them.
+
+The script also uses only built-in .NET classes already present in Windows
+(`System.Net.WebUtility`, `System.Security.Cryptography.Aes`, `System.Xml`) — no
+external libraries.
+
+### How to install the modules
+
+RSAT ships with Windows. Pick the method that matches your OS:
+
+**Windows 10 / 11 (Features on Demand — recommended, no download needed):**
+
+```powershell
+Add-WindowsCapability -Online -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+Add-WindowsCapability -Online -Name 'Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0'
+Add-WindowsCapability -Online -Name 'Rsat.Dns.Tools~~~~0.0.1.0'
+```
+
+Or via **Settings → System → Optional features → Add an optional feature → "RSAT"**.
+
+**Windows Server (Server Manager / PowerShell):**
+
+```powershell
+Install-WindowsFeature -Name RSAT-AD-PowerShell, GPMC, RSAT-DNS-Server
+```
+
+**Download links (Microsoft):**
+
+- RSAT overview & Features-on-Demand instructions:
+  <https://learn.microsoft.com/windows-server/remote/remote-server-administration-tools>
+- Legacy standalone RSAT package (older Windows 10 builds, before 1809):
+  <https://www.microsoft.com/download/details.aspx?id=45520>
+- `ActiveDirectory` module reference:
+  <https://learn.microsoft.com/powershell/module/activedirectory/>
+
+Verify the modules are present:
+
+```powershell
+Get-Module -ListAvailable ActiveDirectory, GroupPolicy, DnsServer
+```
 
 ## Usage
 
