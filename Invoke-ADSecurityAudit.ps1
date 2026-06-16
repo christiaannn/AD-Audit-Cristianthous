@@ -147,11 +147,15 @@ function Encode-Html {
     [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
-# Converts a collection of objects to an HTML table with selected/ordered columns.
+# Converts a collection of objects to a searchable / sortable HTML table.
+#   -RiskColumns : only in these columns is a boolean value colour-coded
+#                  (True = red/risk, False = green). This avoids painting every
+#                  benign boolean (Enabled, IsGlobalCatalog, ...) red.
 function Convert-ToHtmlTable {
     param(
         $Data,
         [string[]]$Properties,
+        [string[]]$RiskColumns,
         [string]$EmptyMessage = 'No data / no objects found.'
     )
     $rows = @($Data)
@@ -161,11 +165,16 @@ function Convert-ToHtmlTable {
     if (-not $Properties) {
         $Properties = $rows[0].PSObject.Properties.Name
     }
+    $riskSet = @{}
+    foreach ($rc in $RiskColumns) { $riskSet[$rc] = $true }
+
+    $tid = 't' + [guid]::NewGuid().ToString('N').Substring(0,8)
 
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.Append("<div class='tablewrap'><table><thead><tr>")
+    [void]$sb.Append("<div class='tabletools'><input type='text' class='tsearch' placeholder='Filter rows...' data-target='$tid'></div>")
+    [void]$sb.Append("<div class='tablewrap'><table id='$tid' class='sortable'><thead><tr>")
     foreach ($p in $Properties) {
-        [void]$sb.Append("<th>$(Encode-Html $p)</th>")
+        [void]$sb.Append("<th title='Click to sort'>$(Encode-Html $p)</th>")
     }
     [void]$sb.Append("</tr></thead><tbody>")
 
@@ -177,10 +186,11 @@ function Convert-ToHtmlTable {
                 $val = ($val | ForEach-Object { "$_" }) -join '; '
             }
             $cell = Encode-Html ("$val")
-            # Highlight boolean-style risk values.
             $class = ''
-            if ("$val" -eq 'True')  { $class = " class='flag-true'" }
-            if ("$val" -eq 'False') { $class = " class='flag-false'" }
+            if ($riskSet.ContainsKey($p)) {
+                if ("$val" -eq 'True')  { $class = " class='flag-true'" }
+                if ("$val" -eq 'False') { $class = " class='flag-false'" }
+            }
             [void]$sb.Append("<td$class>$cell</td>")
         }
         [void]$sb.Append("</tr>")
@@ -214,6 +224,94 @@ function ConvertTo-DateTimeSafe {
         if ($long -le 0 -or $long -eq [int64]::MaxValue) { return $null }
         return [datetime]::FromFileTime($long)
     } catch { return $null }
+}
+
+# Neutralises CSV/Excel formula injection by prefixing risky leading characters.
+# Cells beginning with = + - @ (or tab/CR) are executed as formulas by Excel.
+function Protect-CsvValue {
+    param($Value)
+    $s = "$Value"
+    if ($s.Length -gt 0 -and ('=','+','-','@',"`t","`r") -contains $s[0]) {
+        return "'" + $s
+    }
+    return $s
+}
+
+# Sanitises every string property of every object in a dataset for safe CSV export.
+function ConvertTo-SafeCsvObjects {
+    param($Data)
+    foreach ($obj in @($Data)) {
+        $ht = [ordered]@{}
+        foreach ($prop in $obj.PSObject.Properties) {
+            $ht[$prop.Name] = Protect-CsvValue $prop.Value
+        }
+        [pscustomobject]$ht
+    }
+}
+
+# Well-known trustees that legitimately hold broad rights over privileged objects.
+# Used to suppress noise in the ACL analysis so only unexpected ACEs surface.
+$script:SafeAclTrustees = @(
+    'NT AUTHORITY\SYSTEM','NT AUTHORITY\SELF','NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS',
+    'NT AUTHORITY\Authenticated Users','BUILTIN\Administrators','BUILTIN\Pre-Windows 2000 Compatible Access',
+    'CREATOR OWNER','S-1-5-32-548','Everyone'
+) -as [string[]]
+$script:SafeTrusteeSuffixes = @(
+    'Domain Admins','Enterprise Admins','Schema Admins','Administrators',
+    'Domain Controllers','Enterprise Key Admins','Key Admins'
+)
+
+# Rights considered dangerous when held over a privileged object by a non-default trustee.
+$script:DangerousRights = @('GenericAll','GenericWrite','WriteDacl','WriteOwner','WriteProperty','Self','ExtendedRight','CreateChild','DeleteChild')
+
+# Extended-right GUIDs that enable DCSync (replication of secrets).
+$script:DcSyncGuids = @{
+    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
+    '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
+    '89e95b76-444d-4c62-991a-0facbeda640c' = 'DS-Replication-Get-Changes-In-Filtered-Set'
+}
+
+function Test-SafeTrustee {
+    param([string]$Identity)
+    if ([string]::IsNullOrWhiteSpace($Identity)) { return $true }
+    if ($script:SafeAclTrustees -contains $Identity) { return $true }
+    foreach ($suffix in $script:SafeTrusteeSuffixes) {
+        if ($Identity -like "*\$suffix") { return $true }
+    }
+    return $false
+}
+
+# Returns dangerous ACEs from an object's security descriptor.
+function Get-DangerousAce {
+    param([string]$TargetName, $Acl)
+    if (-not $Acl) { return }
+    foreach ($ace in $Acl.Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        $idt = "$($ace.IdentityReference)"
+        if (Test-SafeTrustee $idt) { continue }
+
+        $rights = "$($ace.ActiveDirectoryRights)"
+        $isDangerous = $false
+        foreach ($dr in $script:DangerousRights) {
+            if ($rights -match $dr) { $isDangerous = $true; break }
+        }
+        # Map extended-right GUIDs (e.g. DCSync) to friendly names.
+        $extra = ''
+        $guid = "$($ace.ObjectType)"
+        if ($script:DcSyncGuids.ContainsKey($guid)) {
+            $isDangerous = $true
+            $extra = $script:DcSyncGuids[$guid]
+        }
+        if (-not $isDangerous) { continue }
+
+        [pscustomobject]@{
+            Object        = $TargetName
+            Trustee       = $idt
+            Rights        = $rights
+            ExtendedRight = $extra
+            Inherited     = $ace.IsInherited
+        }
+    }
 }
 
 #endregion
@@ -536,7 +634,7 @@ try {
         'Description','Title','Department','Company','mail','MemberOf','primaryGroupID',
         'msDS-AllowedToActOnBehalfOfOtherIdentity'
     )
-    $users = Get-ADUser @script:ADParams -Filter * -Properties $userProps
+    $users = Get-ADUser @script:ADParams -Filter * -Properties $userProps -ResultPageSize 2000
 
     $inactiveCutoff = (Get-Date).AddDays(-$InactiveDays)
 
@@ -595,7 +693,10 @@ try {
     }
 
     $body  = "<h3>User Posture Summary</h3>" + (Convert-ToKvTable $summary)
-    $body += "<h3>All Users</h3>" + (Convert-ToHtmlTable $userTable)
+    $userRiskCols = @('PwdNeverExpires','PwdNotRequired','PwdExpired','Kerberoastable_SPN',
+                      'ASREP_NoPreAuth','UnconstrainedDeleg','ConstrainedDeleg','RBCD_Configured',
+                      'HasSIDHistory','LockedOut')
+    $body += "<h3>All Users</h3>" + (Convert-ToHtmlTable $userTable -RiskColumns $userRiskCols)
 
     Add-Section -Id 'users' -Title '8. User Accounts' `
         -Description 'Full user inventory with security-relevant attributes (delegation, SPN, preauth, password flags).' `
@@ -667,15 +768,19 @@ try {
         'Protected Users','Distributed COM Users','Remote Desktop Users'
     )
 
+    # Build a SamAccountName -> account-detail lookup once, reusing the user data
+    # already collected in section 8 (avoids one Get-ADUser per member).
+    $userLookup = @{}
+    foreach ($u in @($script:Datasets['Users'])) {
+        if ($u.SamAccountName) { $userLookup[$u.SamAccountName] = $u }
+    }
+
     $privMembers = foreach ($g in $privGroups) {
         try {
             $grp = Get-ADGroup @script:ADParams -Identity $g -ErrorAction Stop
             $members = Get-ADGroupMember @script:ADParams -Identity $grp -Recursive -ErrorAction SilentlyContinue
             foreach ($m in $members) {
-                $detail = $null
-                if ($m.objectClass -eq 'user') {
-                    $detail = Get-ADUser @script:ADParams -Identity $m.SamAccountName -Properties Enabled, LastLogonDate, PasswordLastSet -ErrorAction SilentlyContinue
-                }
+                $detail = $userLookup[$m.SamAccountName]
                 [pscustomobject]@{
                     Group           = $g
                     Member          = $m.SamAccountName
@@ -716,7 +821,7 @@ try {
 
 try {
     Write-Step "Collecting all groups"
-    $groups = Get-ADGroup @script:ADParams -Filter * -Properties GroupCategory, GroupScope, member, whenCreated, Description, adminCount, managedBy |
+    $groups = Get-ADGroup @script:ADParams -Filter * -Properties GroupCategory, GroupScope, member, whenCreated, Description, adminCount, managedBy -ResultPageSize 2000 |
         ForEach-Object {
             [pscustomobject]@{
                 Name        = $_.Name
@@ -753,7 +858,7 @@ try {
                    'Enabled','whenCreated','IPv4Address','TrustedForDelegation',
                    'msDS-AllowedToDelegateTo','msDS-AllowedToActOnBehalfOfOtherIdentity',
                    'ms-Mcs-AdmPwd','description','DistinguishedName')
-    $computers = Get-ADComputer @script:ADParams -Filter * -Properties $compProps
+    $computers = Get-ADComputer @script:ADParams -Filter * -Properties $compProps -ResultPageSize 2000
 
     $compTable = foreach ($c in $computers) {
         [pscustomobject]@{
@@ -783,7 +888,8 @@ try {
         ForEach-Object { [pscustomobject]@{ OperatingSystem = $_.Name; Count = $_.Count } }
 
     $body  = "<h3>Operating System Breakdown</h3>" + (Convert-ToHtmlTable $osBreakdown)
-    $body += "<h3>All Computers</h3>" + (Convert-ToHtmlTable $compTable)
+    $compRiskCols = @('UnconstrainedDeleg','ConstrainedDeleg','RBCD_Configured')
+    $body += "<h3>All Computers</h3>" + (Convert-ToHtmlTable $compTable -RiskColumns $compRiskCols)
     Add-Section -Id 'computers' -Title '12. Computer Accounts' `
         -Description 'Computer inventory with OS, last logon, delegation flags and LAPS presence.' -Body $body
 
@@ -1007,14 +1113,88 @@ try {
             }
         }
     if ($cas) {
-        Add-Section -Id 'adcs' -Title '18. Active Directory Certificate Services' `
-            -Description 'Enterprise CAs and published certificate templates. Misconfigured templates (ESC1-ESC8) are a major escalation path - review with a dedicated tool such as Certify/Locksmith.' `
-            -Body (Convert-ToHtmlTable $cas)
         Register-Dataset 'CertificateAuthorities' $cas | Out-Null
-        Add-Finding -Severity 'Info' -Category 'PKI' `
-            -Title 'AD Certificate Services present - review template ACLs/EKUs for ESC vulnerabilities' -Count @($cas).Count
+        $publishedTemplates = $cas | ForEach-Object { $_.Templates -split '; ' } | Where-Object { $_ } | Select-Object -Unique
+
+        # Enumerate certificate templates and evaluate common ESC misconfigurations.
+        $tmplPath = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNc"
+        $clientAuthOids = @('1.3.6.1.5.5.7.3.2','1.3.6.1.5.2.3.4','1.3.6.1.4.1.311.20.2.2','2.5.29.37.0')
+
+        $tmplProps = @('displayName','msPKI-Certificate-Name-Flag','msPKI-Enrollment-Flag',
+                       'msPKI-RA-Signature','pKIExtendedKeyUsage','nTSecurityDescriptor')
+        $templates = Get-ADObject @script:ADParams -SearchBase $tmplPath -LDAPFilter '(objectClass=pKICertificateTemplate)' `
+            -Properties $tmplProps -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $nameFlag   = [int]($_.'msPKI-Certificate-Name-Flag')
+                $enrollFlag = [int]($_.'msPKI-Enrollment-Flag')
+                $raSig      = [int]($_.'msPKI-RA-Signature')
+                $ekus       = @($_.pKIExtendedKeyUsage)
+
+                $suppliesSubject = (($nameFlag -band 0x00000001) -ne 0)   # ENROLLEE_SUPPLIES_SUBJECT
+                $managerApproval = (($enrollFlag -band 0x00000002) -ne 0)  # PEND_ALL_REQUESTS
+                $authEnabled     = ($ekus.Count -eq 0) -or ($ekus | Where-Object { $clientAuthOids -contains $_ })
+                $anyPurpose      = ($ekus.Count -eq 0) -or ($ekus -contains '2.5.29.37.0')
+
+                # Which non-default trustees can enroll?
+                $enrollers = @()
+                try {
+                    foreach ($ace in $_.nTSecurityDescriptor.Access) {
+                        if ($ace.AccessControlType -ne 'Allow') { continue }
+                        $idt = "$($ace.IdentityReference)"
+                        if (Test-SafeTrustee $idt) { continue }
+                        $r = "$($ace.ActiveDirectoryRights)"
+                        $g = "$($ace.ObjectType)"
+                        # Enroll / AutoEnroll extended right GUIDs, or full control.
+                        if ($r -match 'GenericAll|ExtendedRight' -and
+                            ($g -eq '0e10c968-78fb-11d2-90d4-00c04f79dc55' -or $g -eq 'a05b8cc2-17bc-4802-a710-e7c15ab866a2' -or $g -eq '00000000-0000-0000-0000-000000000000' -or $r -match 'GenericAll')) {
+                            $enrollers += $idt
+                        }
+                    }
+                } catch {}
+                $enrollers = $enrollers | Select-Object -Unique
+
+                # ESC1: low-priv enroll + supplies subject + client-auth EKU + no approval + no RA signature.
+                $esc1 = ($suppliesSubject -and $authEnabled -and -not $managerApproval -and $raSig -eq 0 -and $enrollers.Count -gt 0)
+                # ESC2: Any Purpose / no EKU usable for auth, low-priv enroll, no approval.
+                $esc2 = ($anyPurpose -and -not $managerApproval -and $enrollers.Count -gt 0)
+                # ESC3: Certificate Request Agent EKU.
+                $esc3 = (($ekus -contains '1.3.6.1.4.1.311.20.2.1') -and -not $managerApproval -and $enrollers.Count -gt 0)
+
+                [pscustomobject]@{
+                    Template          = $_.Name
+                    DisplayName       = $_.displayName
+                    Published         = ($publishedTemplates -contains $_.Name)
+                    EnrolleeSuppliesSubject = $suppliesSubject
+                    ManagerApproval   = $managerApproval
+                    AuthEKU           = [bool]$authEnabled
+                    AnyPurposeEKU     = [bool]$anyPurpose
+                    LowPrivEnrollers  = ($enrollers -join '; ')
+                    ESC1              = $esc1
+                    ESC2              = $esc2
+                    ESC3              = $esc3
+                }
+            }
+        $templates = Register-Dataset 'CertificateTemplates' $templates
+
+        $tmplRisk = @('EnrolleeSuppliesSubject','AnyPurposeEKU','ESC1','ESC2','ESC3')
+        $body  = "<h3>Certification Authorities</h3>" + (Convert-ToHtmlTable $cas)
+        $body += "<h3>Certificate Templates (ESC analysis)</h3>" + (Convert-ToHtmlTable $templates -RiskColumns $tmplRisk)
+        Add-Section -Id 'adcs' -Title '18. Active Directory Certificate Services (AD CS)' `
+            -Description 'Enterprise CAs and certificate templates with heuristic ESC1/ESC2/ESC3 analysis. This is a heuristic; confirm findings with a dedicated tool (Certify/Certipy/Locksmith) before remediation.' `
+            -Body $body
+
+        $escVuln = @($templates | Where-Object { $_.ESC1 -or $_.ESC2 -or $_.ESC3 })
+        if ($escVuln.Count -gt 0) {
+            Add-Finding -Severity 'Critical' -Category 'PKI' `
+                -Title 'Certificate templates vulnerable to ESC privilege escalation' `
+                -Detail (($escVuln | ForEach-Object { $_.Template }) -join ', ') `
+                -Count $escVuln.Count
+        } else {
+            Add-Finding -Severity 'Info' -Category 'PKI' `
+                -Title 'AD CS present - no obvious ESC1/2/3 templates detected (verify manually)' -Count @($cas).Count
+        }
     } else {
-        Add-Section -Id 'adcs' -Title '18. Active Directory Certificate Services' `
+        Add-Section -Id 'adcs' -Title '18. Active Directory Certificate Services (AD CS)' `
             -Description 'No enterprise CA found in the configuration partition.' `
             -Body "<p class='empty'>No AD CS enrollment services detected.</p>"
     }
@@ -1080,6 +1260,181 @@ try {
 
 #endregion
 
+#region ------------------------------------------------- 21. Additional hardening checks
+
+try {
+    Write-Step "Collecting additional hardening indicators"
+
+    # ms-DS-MachineAccountQuota: how many computer accounts a normal user may join.
+    $maq = $null
+    try {
+        $maq = (Get-ADObject @script:ADParams -Identity $domain.DistinguishedName -Properties 'ms-DS-MachineAccountQuota').'ms-DS-MachineAccountQuota'
+    } catch {}
+
+    # Members of "Pre-Windows 2000 Compatible Access" (S-1-5-32-554). Authenticated
+    # Users / Everyone here weakens default read protections.
+    $preWin2k = @()
+    try {
+        $pw = Get-ADGroup @script:ADParams -Identity 'S-1-5-32-554' -ErrorAction SilentlyContinue
+        if ($pw) {
+            $preWin2k = Get-ADGroupMember @script:ADParams -Identity $pw -ErrorAction SilentlyContinue |
+                Select-Object Name, SamAccountName, objectClass
+        }
+    } catch {}
+
+    # Privileged accounts that are NOT in Protected Users (recommended for admins).
+    $protectedUsersMembers = @($script:Datasets['PrivilegedGroupMembers'] | Where-Object { $_.Group -eq 'Protected Users' } | Select-Object -ExpandProperty Member)
+    $daMembers = @($script:Datasets['PrivilegedGroupMembers'] | Where-Object { $_.Group -in 'Domain Admins','Enterprise Admins' -and $_.Class -eq 'user' })
+    $daNotProtected = @($daMembers | Where-Object { $protectedUsersMembers -notcontains $_.Member } | Select-Object -ExpandProperty Member -Unique)
+
+    $kv = [ordered]@{
+        'ms-DS-MachineAccountQuota'                  = if ($null -ne $maq) { $maq } else { 'n/a' }
+        'Pre-Windows 2000 Compatible Access members'  = if ($preWin2k) { ($preWin2k.Name -join '; ') } else { '(none)' }
+        'Domain/Enterprise Admins NOT in Protected Users' = if ($daNotProtected) { ($daNotProtected -join '; ') } else { '(all protected / none)' }
+    }
+    Add-Section -Id 'hardening' -Title '21. Additional Hardening Checks' `
+        -Description 'Machine account quota, legacy compatibility group membership and Protected Users coverage for privileged accounts.' `
+        -Body (Convert-ToKvTable $kv)
+
+    if ($null -ne $maq -and $maq -gt 0) {
+        Add-Finding -Severity 'High' -Category 'Hardening' `
+            -Title "Any authenticated user can join up to $maq computer accounts (MachineAccountQuota)" `
+            -Detail 'A non-zero quota enables RBCD and other computer-account abuse. Set ms-DS-MachineAccountQuota to 0 and delegate machine joins explicitly.'
+    }
+    $preWin2kRisk = @($preWin2k | Where-Object { $_.Name -match 'Authenticated Users|Everyone|Anonymous' })
+    if ($preWin2kRisk.Count -gt 0) {
+        Add-Finding -Severity 'Medium' -Category 'Hardening' `
+            -Title 'Authenticated Users / Everyone in Pre-Windows 2000 Compatible Access' `
+            -Detail 'This weakens default directory read restrictions.'
+    }
+    if ($daNotProtected.Count -gt 0) {
+        Add-Finding -Severity 'Low' -Category 'Hardening' `
+            -Title 'Privileged accounts not in the Protected Users group' -Count $daNotProtected.Count
+    }
+} catch { Add-AuditError -Area 'Hardening' -Message $_.Exception.Message }
+
+#endregion
+
+#region ------------------------------------------------- 22. ACL analysis (attack paths)
+
+try {
+    Write-Step "Analyzing ACLs on high-value objects (attack paths)"
+
+    # Build the list of high-value targets: domain root, AdminSDHolder, privileged
+    # groups and the members of Domain/Enterprise Admins.
+    $targets = [System.Collections.Generic.List[object]]::new()
+    $targets.Add([pscustomobject]@{ Name = 'Domain root'; DN = $domain.DistinguishedName })
+    $targets.Add([pscustomobject]@{ Name = 'AdminSDHolder'; DN = "CN=AdminSDHolder,CN=System,$($domain.DistinguishedName)" })
+
+    foreach ($g in 'Domain Admins','Enterprise Admins','Administrators','Schema Admins') {
+        try {
+            $gd = Get-ADGroup @script:ADParams -Identity $g -ErrorAction Stop
+            $targets.Add([pscustomobject]@{ Name = "Group: $g"; DN = $gd.DistinguishedName })
+        } catch {}
+    }
+    foreach ($m in @($script:Datasets['PrivilegedGroupMembers'] | Where-Object { $_.Group -in 'Domain Admins','Enterprise Admins' -and $_.Class -eq 'user' } | Select-Object -ExpandProperty Member -Unique)) {
+        try {
+            $ud = Get-ADUser @script:ADParams -Identity $m -ErrorAction Stop
+            $targets.Add([pscustomobject]@{ Name = "User: $m"; DN = $ud.DistinguishedName })
+        } catch {}
+    }
+
+    $dangerAces = foreach ($t in $targets) {
+        try {
+            $obj = Get-ADObject @script:ADParams -Identity $t.DN -Properties nTSecurityDescriptor -ErrorAction Stop
+            Get-DangerousAce -TargetName $t.Name -Acl $obj.nTSecurityDescriptor
+        } catch { Add-AuditError -Area 'ACL' -Message "$($t.DN): $($_.Exception.Message)" }
+    }
+    $dangerAces = Register-Dataset 'DangerousACLs' $dangerAces
+
+    Add-Section -Id 'acls' -Title '22. ACL Analysis - Attack Paths' `
+        -Description 'Non-default principals holding dangerous rights (GenericAll, WriteDacl, WriteOwner, etc.) or DCSync rights over high-value objects. These are direct privilege-escalation paths. For full graph analysis use BloodHound/SharpHound.' `
+        -Body (Convert-ToHtmlTable $dangerAces -EmptyMessage 'No dangerous non-default ACEs detected on the inspected objects.')
+
+    $dcsync = @($dangerAces | Where-Object { $_.ExtendedRight -match 'Get-Changes' })
+    if ($dcsync.Count -gt 0) {
+        Add-Finding -Severity 'Critical' -Category 'ACL' `
+            -Title 'Non-default principals hold DCSync (replication) rights on the domain' `
+            -Detail (($dcsync | ForEach-Object { $_.Trustee } | Select-Object -Unique) -join ', ') `
+            -Count $dcsync.Count
+    }
+    $otherDanger = @($dangerAces | Where-Object { $_.ExtendedRight -notmatch 'Get-Changes' })
+    if ($otherDanger.Count -gt 0) {
+        Add-Finding -Severity 'High' -Category 'ACL' `
+            -Title 'Dangerous ACEs by non-default principals on privileged objects' `
+            -Count $otherDanger.Count
+    }
+} catch { Add-AuditError -Area 'ACL' -Message $_.Exception.Message }
+
+#endregion
+
+#region ------------------------------------------------- 23. SYSVOL / GPP credentials
+
+try {
+    Write-Step "Scanning SYSVOL for GPP passwords and embedded credentials"
+    $sysvol = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies"
+    $gppFindings = [System.Collections.Generic.List[object]]::new()
+
+    if (Test-Path $sysvol) {
+        # Public AES key used by Group Policy Preferences (Microsoft published it).
+        $gppKey = [byte[]](0x4e,0x99,0x06,0xe8,0xfc,0xb6,0x6c,0xc9,0xfa,0xf4,0x93,0x10,0x62,0x0f,0xfe,0xe8,
+                           0xf4,0x96,0xe8,0x06,0xcc,0x05,0x79,0x90,0x20,0x9b,0x09,0xa4,0x33,0xb6,0x6c,0x1b)
+
+        function Unprotect-GppPassword {
+            param([string]$Cpassword)
+            try {
+                $pad = $Cpassword.Length % 4
+                if ($pad -gt 0) { $Cpassword += ('=' * (4 - $pad)) }
+                $bytes = [Convert]::FromBase64String($Cpassword)
+                $aes = [System.Security.Cryptography.Aes]::Create()
+                $aes.Key = $gppKey
+                $aes.IV  = New-Object byte[] 16
+                $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+                $dec = $aes.CreateDecryptor()
+                $out = $dec.TransformFinalBlock($bytes, 0, $bytes.Length)
+                return [System.Text.Encoding]::Unicode.GetString($out).TrimEnd([char]0)
+            } catch { return '<decrypt failed>' }
+        }
+
+        $xmlFiles = Get-ChildItem -Path $sysvol -Recurse -Include 'Groups.xml','Services.xml','ScheduledTasks.xml','DataSources.xml','Printers.xml','Drives.xml' -ErrorAction SilentlyContinue
+        foreach ($f in $xmlFiles) {
+            try {
+                [xml]$xml = Get-Content -Path $f.FullName -ErrorAction Stop
+                foreach ($node in $xml.SelectNodes('//*[@cpassword]')) {
+                    $cp = $node.Attributes['cpassword'].Value
+                    if ($cp) {
+                        $gppFindings.Add([pscustomobject]@{
+                            File     = $f.FullName.Replace($sysvol,'...')
+                            UserName = $node.Attributes['userName'].Value
+                            Password = Unprotect-GppPassword $cp
+                        })
+                    }
+                }
+            } catch {}
+        }
+
+        if ($gppFindings.Count -gt 0) {
+            Add-Section -Id 'sysvol' -Title '23. SYSVOL / Group Policy Preferences Credentials' `
+                -Description 'Credentials embedded in Group Policy Preferences are encrypted with a publicly known key and can be decrypted by any domain user. Remove them immediately and rotate the exposed passwords.' `
+                -Body (Convert-ToHtmlTable $gppFindings)
+            Register-Dataset 'GPPCredentials' $gppFindings | Out-Null
+            Add-Finding -Severity 'Critical' -Category 'Credentials' `
+                -Title 'Cleartext-recoverable credentials found in SYSVOL (GPP cpassword)' `
+                -Count $gppFindings.Count
+        } else {
+            Add-Section -Id 'sysvol' -Title '23. SYSVOL / Group Policy Preferences Credentials' `
+                -Description 'Scanned Group Policy Preferences XML files in SYSVOL for cpassword attributes.' `
+                -Body "<p class='empty'>No GPP cpassword entries found in SYSVOL.</p>"
+        }
+    } else {
+        Add-Section -Id 'sysvol' -Title '23. SYSVOL / Group Policy Preferences Credentials' `
+            -Description "SYSVOL share was not reachable at $sysvol." `
+            -Body "<p class='empty'>SYSVOL not accessible - section skipped.</p>"
+    }
+} catch { Add-AuditError -Area 'SYSVOL' -Message $_.Exception.Message }
+
+#endregion
+
 #region ------------------------------------------------- CSV export
 
 if ($ExportCsv) {
@@ -1087,7 +1442,8 @@ if ($ExportCsv) {
     if (-not (Test-Path $csvFolder)) { New-Item -ItemType Directory -Path $csvFolder -Force | Out-Null }
     foreach ($name in $script:Datasets.Keys) {
         try {
-            $script:Datasets[$name] | Export-Csv -Path (Join-Path $csvFolder "$name.csv") -NoTypeInformation -Encoding UTF8
+            ConvertTo-SafeCsvObjects $script:Datasets[$name] |
+                Export-Csv -Path (Join-Path $csvFolder "$name.csv") -NoTypeInformation -Encoding UTF8
         } catch { Add-AuditError -Area "CSV:$name" -Message $_.Exception.Message }
     }
 }
@@ -1197,6 +1553,12 @@ table.kv th{width:300px;color:var(--muted);background:#0b1220}
 tr.sev-critical td:first-child,tr.sev-high td:first-child{font-weight:700}
 a{color:var(--accent)}
 footer{color:var(--muted);text-align:center;padding:20px;font-size:12px}
+.tabletools{margin:6px 0}
+.tsearch{width:280px;max-width:100%;padding:6px 10px;border-radius:6px;border:1px solid #334155;background:#0b1220;color:var(--text);font-size:13px}
+table.sortable thead th{cursor:pointer;user-select:none}
+table.sortable thead th:hover{color:#fff}
+table.sortable thead th.asc::after{content:" \25B2";font-size:9px;color:var(--accent)}
+table.sortable thead th.desc::after{content:" \25BC";font-size:9px;color:var(--accent)}
 '@
 
 $cards = @"
@@ -1250,6 +1612,43 @@ $html = @"
   </main>
 </div>
 <footer>Generated by Invoke-ADSecurityAudit.ps1 &mdash; read-only Active Directory audit. Handle this report as confidential.</footer>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  // Per-table row filter.
+  document.querySelectorAll('.tsearch').forEach(function (box) {
+    box.addEventListener('input', function () {
+      var table = document.getElementById(box.getAttribute('data-target'));
+      if (!table) { return; }
+      var term = box.value.toLowerCase();
+      table.querySelectorAll('tbody tr').forEach(function (tr) {
+        tr.style.display = tr.textContent.toLowerCase().indexOf(term) > -1 ? '' : 'none';
+      });
+    });
+  });
+
+  // Click-to-sort columns.
+  document.querySelectorAll('table.sortable thead th').forEach(function (th, idx) {
+    th.addEventListener('click', function () {
+      var table = th.closest('table');
+      var tbody = table.querySelector('tbody');
+      var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+      var asc = !th.classList.contains('asc');
+      table.querySelectorAll('thead th').forEach(function (h) { h.classList.remove('asc', 'desc'); });
+      th.classList.add(asc ? 'asc' : 'desc');
+      rows.sort(function (a, b) {
+        var x = a.children[idx] ? a.children[idx].textContent.trim() : '';
+        var y = b.children[idx] ? b.children[idx].textContent.trim() : '';
+        var nx = parseFloat(x.replace(/[^0-9.\-]/g, ''));
+        var ny = parseFloat(y.replace(/[^0-9.\-]/g, ''));
+        var bothNum = !isNaN(nx) && !isNaN(ny) && x !== '' && y !== '';
+        var cmp = bothNum ? (nx - ny) : x.localeCompare(y, undefined, { numeric: true });
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function (r) { tbody.appendChild(r); });
+    });
+  });
+});
+</script>
 </body>
 </html>
 "@

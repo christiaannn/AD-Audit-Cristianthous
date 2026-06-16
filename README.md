@@ -75,9 +75,29 @@ If script execution is blocked, run PowerShell with:
 15. Group Policy objects, GPO links, optional full settings report
 16. AdminSDHolder-protected objects (`adminCount=1`)
 17. DNS zones (with `-Server` and DnsServer module)
-18. Active Directory Certificate Services (CAs, templates)
+18. Active Directory Certificate Services – CAs **plus heuristic ESC1/ESC2/ESC3
+    template analysis**
 19. Service accounts (SPN accounts + gMSA/sMSA)
 20. LAPS coverage
+21. Additional hardening – `ms-DS-MachineAccountQuota`, Pre-Windows 2000
+    Compatible Access membership, Protected Users coverage for admins
+22. **ACL analysis (attack paths)** – non-default principals with dangerous
+    rights (GenericAll/WriteDacl/WriteOwner/…) or **DCSync** rights over the
+    domain root, AdminSDHolder, privileged groups and admin accounts
+23. **SYSVOL / GPP credentials** – scans Group Policy Preferences XML for
+    `cpassword` and decrypts it (publicly known key)
+
+### Usability features
+
+- Every data table is **searchable** (per-table filter box) and **sortable**
+  (click any column header).
+- Boolean risk columns are colour-coded only where a `True`/`False` is actually
+  security-relevant (no more "everything is red").
+- CSV exports are protected against spreadsheet **formula injection**.
+
+> **Heuristic note:** the ESC (AD CS) and ACL attack-path sections are
+> heuristics meant to point you at likely issues. Confirm findings with
+> dedicated tools (Certify/Certipy, BloodHound/SharpHound) before remediation.
 
 The **Executive Summary** at the top lists all findings ranked
 Critical → High → Medium → Low → Info, with severity counters.
