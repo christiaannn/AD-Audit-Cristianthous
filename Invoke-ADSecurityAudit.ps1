@@ -361,15 +361,13 @@ try {
         'SPN Suffixes'                = ($forest.SPNSuffixes -join ', ')
         'Schema Master'               = $forest.SchemaMaster
         'Domain Naming Master'        = $forest.DomainNamingMaster
-        'Schema Naming Context'       = $forest.PartitionsContainer
+        'Partitions Container'        = $forest.PartitionsContainer
     }
 
-    # Schema version (object version of the schema container).
-    try {
-        $schema = Get-ADObject @script:ADParams -Identity $forest.SchemaMaster -ErrorAction SilentlyContinue
-    } catch {}
+    # Schema naming context and version (object version of the schema container).
     try {
         $schemaNc = (Get-ADRootDSE @script:ADParams).schemaNamingContext
+        $forestInfo['Schema Naming Context'] = $schemaNc
         $schemaObj = Get-ADObject @script:ADParams -Identity $schemaNc -Properties objectVersion
         $forestInfo['Schema Version (objectVersion)'] = $schemaObj.objectVersion
     } catch {}
@@ -1128,9 +1126,10 @@ try {
         $templates = Get-ADObject @script:ADParams -SearchBase $tmplPath -LDAPFilter '(objectClass=pKICertificateTemplate)' `
             -Properties $tmplProps -ErrorAction SilentlyContinue |
             ForEach-Object {
-                $nameFlag   = [int]($_.'msPKI-Certificate-Name-Flag')
-                $enrollFlag = [int]($_.'msPKI-Enrollment-Flag')
-                $raSig      = [int]($_.'msPKI-RA-Signature')
+                # Cast via int64 to avoid overflow on flags that set the high bit.
+                $nameFlag   = [int64]($_.'msPKI-Certificate-Name-Flag')
+                $enrollFlag = [int64]($_.'msPKI-Enrollment-Flag')
+                $raSig      = [int64]($_.'msPKI-RA-Signature')
                 $ekus       = @($_.pKIExtendedKeyUsage)
 
                 $suppliesSubject = (($nameFlag -band 0x00000001) -ne 0)   # ENROLLEE_SUPPLIES_SUBJECT
